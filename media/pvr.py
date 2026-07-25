@@ -72,7 +72,7 @@ class PVR(ABC):
         try:
             # make request
             req = requests.get(
-                os.path.join(misc_str.ensure_endswith(self.server_url, "/"), 'api/v3/qualityProfile'),
+                os.path.join(misc_str.ensure_endswith(self.server_url, "/"), 'api/v3/qualityprofile'),
                 headers=self.headers,
                 timeout=60,
                 allow_redirects=False
@@ -174,7 +174,7 @@ class PVR(ABC):
             log.debug("Request Response Text:\n%s", req.text)
 
             response_json = None
-            if 'json' in req.headers['Content-Type'].lower():
+            if 'json' in req.headers.get('Content-Type', '').lower():
                 response_json = misc.get_response_dict(req.json(), identifier_field, identifier)
 
             if (
