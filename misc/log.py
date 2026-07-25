@@ -36,8 +36,8 @@ class Logger:
 
             self.file_handler = RotatingFileHandler(
                 self.log_file_path,
-                maxBytes=1024 * 1024 * 2,
-                backupCount=5
+                maxBytes=1024 * 1024 * 50,  # 50MB Limit
+                backupCount=1               # 1 Backup file
             )
             self.file_handler.setFormatter(self.log_formatter)
             self.root_logger.addHandler(self.file_handler)
@@ -49,5 +49,6 @@ class Logger:
         return self.root_logger.getChild(name)
 
 
-# Default logger
+# Default Logger (Restored "Smart" Logic)
+# This line checks your config.json to decide if it should be DEBUG or INFO
 logger = Logger(Config().logfile, logging.DEBUG if Config().cfg.core.debug else logging.INFO)
