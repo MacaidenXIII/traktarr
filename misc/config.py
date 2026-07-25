@@ -92,7 +92,6 @@ class Config(object, metaclass=Singleton):
         },
         'sonarr': {
             'api_key': '',
-            'language': 'English',
             'quality': 'HD-1080p',
             'root_folder': '/tv/',
             'season_folder': True,
