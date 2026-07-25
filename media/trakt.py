@@ -262,8 +262,17 @@ class Trakt:
         print(self._headers_without_authentication())
 
         # Request device code
-        req = requests.post('https://api.trakt.tv/oauth/device/code', params=payload,
+        req = requests.post('https://api.trakt.tv/oauth/device/code', json=payload,
                             headers=self._headers_without_authentication())
+        # Log the raw response so authentication failures reveal the actual
+        # Trakt error instead of failing later with a KeyError.
+        log.info("Trakt device authentication HTTP status: %d", req.status_code)
+        log.info("Trakt device authentication response: %s", req.text)
+
+        if req.status_code != 200:
+            log.error("Trakt device authentication request failed. Please check the response above.")
+            return None
+
         device_code_response = req.json()
 
         # Display needed information to the user
@@ -286,15 +295,22 @@ class Trakt:
             temp_headers['Authorization'] = 'Bearer ' + access_token
 
             req = requests.get('https://api.trakt.tv/users/me', headers=temp_headers)
+            user_info = req.json()
+            username = user_info['username']
 
             from misc.config import Config
             new_config = Config()
 
+            # Save to Disk
             new_config.merge_settings({
                 "trakt": {
-                    req.json()['username']: access_token_response
+                    username: access_token_response
                 }
             })
+
+            # HOT FIX: Update the CURRENT in-memory config
+            # This ensures the script uses the new token immediately without restarting
+            self.cfg['trakt'][username] = access_token_response
 
             success = True
         elif req.status_code == 404:
@@ -326,7 +342,7 @@ class Trakt:
                        'client_secret': self.cfg.trakt.client_secret, 'grant_type': 'authorization_code'}
 
             # Poll Trakt for access token
-            req = requests.post('https://api.trakt.tv/oauth/device/token', params=payload,
+            req = requests.post('https://api.trakt.tv/oauth/device/token', json=payload,
                                 headers=self._headers_without_authentication())
 
             success, status_code = self.__oauth_process_token_request(req)
@@ -344,8 +360,13 @@ class Trakt:
         payload = {'refresh_token': refresh_token, 'client_id': self.cfg.trakt.client_id,
                    'client_secret': self.cfg.trakt.client_secret, 'grant_type': 'refresh_token'}
 
-        req = requests.post('https://api.trakt.tv/oauth/token', params=payload,
+        req = requests.post('https://api.trakt.tv/oauth/token', json=payload,
                             headers=self._headers_without_authentication())
+
+        # Log the raw refresh response so expired/revoked token failures
+        # reveal the actual Trakt API error.
+        log.info("Trakt OAuth token refresh HTTP status: %d", req.status_code)
+        log.info("Trakt OAuth token refresh response: %s", req.text)
 
         success, status_code = self.__oauth_process_token_request(req)
 
@@ -354,6 +375,11 @@ class Trakt:
     def oauth_authentication(self):
         try:
             device_code_response = self.__oauth_request_device_code()
+
+            # Stop cleanly if Trakt rejected the device-code request.
+            if not device_code_response:
+                log.error("Unable to obtain a Trakt OAuth device code. Authentication aborted.")
+                return False
 
             if self.__oauth_poll_for_access_token(device_code_response['device_code'],
                                                   device_code_response['interval'],
@@ -390,7 +416,8 @@ class Trakt:
                      user)
 
             if self.__oauth_refresh_access_token(token_information["refresh_token"]):
-                log.info("The access token for the user %s has been refreshed. Please restart the application.", user)
+                # HOT FIX: Changed log message to reflect that we are continuing without restart
+                log.info("The access token for the user %s has been refreshed. Resuming operations...", user)
 
     def _user_used_for_authentication(self, user=None):
         if user is None:
