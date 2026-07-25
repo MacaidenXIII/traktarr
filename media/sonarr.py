@@ -13,6 +13,7 @@ log = logger.get_logger(__name__)
 
 class Sonarr(PVR):
     def get_objects(self):
+        # CORRECT: Uses v3 endpoint
         return self._get_objects('api/v3/series')
 
     @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
@@ -21,6 +22,7 @@ class Sonarr(PVR):
         try:
             # make request
             req = requests.get(
+                # CORRECT: Uses v3 singular 'tag'
                 os.path.join(misc_str.ensure_endswith(self.server_url, "/"), 'api/v3/tag'),
                 headers=self.headers,
                 timeout=60,
@@ -42,8 +44,11 @@ class Sonarr(PVR):
         return None
 
     @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
-    def add_series(self, series_tvdb_id, series_title, series_title_slug, quality_profile_id, language_profile_id,
+    def add_series(self, series_tvdb_id, series_title, series_title_slug, quality_profile_id,
                    root_folder, season_folder=True, tag_ids=None, search_missing=False, series_type='standard'):
+        
+        # FIXED: Removed 'language_profile_id' from the arguments above ^
+        
         payload = self._prepare_add_object_payload(series_title, series_title_slug, quality_profile_id, root_folder)
 
         payload = dict_merge(payload, {
@@ -52,12 +57,14 @@ class Sonarr(PVR):
             'seasons': [],
             'seasonFolder': season_folder,
             'seriesType': series_type,
-            'languageProfileId': language_profile_id,
             'addOptions': {
                 'searchForMissingEpisodes': search_missing
             }
         })
 
+        # FIXED: Removed the block that added 'languageProfileId' to the payload
+        
+        # ALWAYS use v3 endpoint.
         endpoint = 'api/v3/series'
 
         return self._add_object(endpoint, payload, identifier_field='tvdbId', identifier=series_tvdb_id)
