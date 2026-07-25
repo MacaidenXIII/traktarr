@@ -3,7 +3,8 @@ import os.path
 import signal
 import sys
 import time
-
+import datetime
+import requests
 import click
 import schedule
 from pyfiglet import Figlet
@@ -14,6 +15,7 @@ from pyfiglet import Figlet
 cfg = None
 log = None
 notify = None
+run_stats = {'movies': [], 'shows': []}  # Added for Run Summary
 
 
 # Click
@@ -118,16 +120,6 @@ def get_quality_profile_id(pvr, quality_profile):
     return quality_profile_id
 
 
-def get_language_profile_id(pvr, language_profile):
-    # retrieve profile id for requested language profile
-    language_profile_id = pvr.get_language_profile_id(language_profile)
-    if not language_profile_id or language_profile_id <= 0:
-        log.error("No Language Profile ID for: %s", language_profile)
-    else:
-        log.info("Retrieved Language Profile ID for \'%s\': %d", language_profile, language_profile_id)
-    return language_profile_id
-
-
 def get_profile_tags(pvr):
     profile_tags = pvr.get_tags()
     if profile_tags is None:
@@ -205,12 +197,13 @@ def show(
         return None
 
     # set common series variables
-    series_title = trakt_show['title']
+    series_title = trakt_show.get('title')
 
     # convert series year to string
-    if trakt_show['year']:
-        series_year = str(trakt_show['year'])
-    elif trakt_show['first_aired']:
+    year_data = trakt_show.get('year')
+    if year_data:
+        series_year = str(year_data)
+    elif trakt_show.get('first_aired'):
         series_year = misc_str.get_year_from_timestamp(trakt_show['first_aired'])
     else:
         series_year = '????'
@@ -219,9 +212,6 @@ def show(
 
     # quality profile id
     quality_profile_id = get_quality_profile_id(sonarr, cfg.sonarr.quality)
-
-    # language profile id
-    language_profile_id = get_language_profile_id(sonarr, cfg.sonarr.language)
 
     # profile tags
     profile_tags = None
@@ -242,7 +232,8 @@ def show(
             )
 
     # series type
-    if any('anime' in s.lower() for s in trakt_show['genres']):
+    genres_list = trakt_show.get('genres', [])
+    if any('anime' in s.lower() for s in genres_list):
         series_type = 'anime'
     else:
         series_type = 'standard'
@@ -255,7 +246,6 @@ def show(
             series_title,
             trakt_show['ids']['slug'],
             quality_profile_id,
-            language_profile_id,
             cfg.sonarr.root_folder,
             cfg.sonarr.season_folder,
             tag_ids,
@@ -377,17 +367,24 @@ def shows(
 
     added_shows = 0
 
-    # process countries
-    if not cfg.filters.shows.allowed_countries or 'ignore' in cfg.filters.shows.allowed_countries:
-        countries = None
-    else:
-        countries = cfg.filters.shows.allowed_countries
+    # -------------------------------------------------------------
+    # DYNAMIC YEAR LOGIC
+    # -------------------------------------------------------------
+    max_year = cfg.filters.shows.get('blacklisted_max_year')
+    if max_year is None or max_year == "":
+        current_year = datetime.datetime.now().year
+        cfg['filters']['shows']['blacklisted_max_year'] = current_year
+        log.debug("Dynamic Config: 'blacklisted_max_year' (Missing/Empty) set to Current Year (%s)", current_year)
+    # -------------------------------------------------------------
 
-    # process languages
-    if not cfg.filters.shows.allowed_languages or 'ignore' in cfg.filters.shows.allowed_languages:
-        languages = None
-    else:
-        languages = cfg.filters.shows.allowed_languages
+    # --- UPDATED: Retrieve config filters but DON'T send to API ---
+    config_countries = None
+    if cfg.filters.shows.allowed_countries and 'ignore' not in cfg.filters.shows.allowed_countries:
+        config_countries = cfg.filters.shows.allowed_countries
+
+    config_languages = None
+    if cfg.filters.shows.allowed_languages and 'ignore' not in cfg.filters.shows.allowed_languages:
+        config_languages = cfg.filters.shows.allowed_languages
 
     # process genres
     if genres:
@@ -443,14 +440,17 @@ def shows(
 
     # quality profile id
     quality_profile_id = get_quality_profile_id(sonarr, cfg.sonarr.quality)
-
-    # language profile id
-    language_profile_id = get_language_profile_id(sonarr, cfg.sonarr.language)
+    
+    # Feature: Fetch Anime Quality Profile ID if configured
+    anime_quality_profile_id = None
+    if cfg.sonarr.get('anime_quality_profile'):
+        anime_quality_profile_id = get_quality_profile_id(sonarr, cfg.sonarr.anime_quality_profile)
 
     # profile tags
     profile_tags = None
     tag_ids = None
     tag_names = None
+    anime_tag_id = None # Store anime tag ID if found
 
     if cfg.sonarr.tags is not None:
         profile_tags = get_profile_tags(sonarr)
@@ -464,15 +464,25 @@ def shows(
                 profile_tags,
                 tag_ids,
             )
+            
+            # Feature: Resolve Anime Tag ID from Config Name
+            if cfg.sonarr.get('anime_tag_name'):
+                anime_tag_name = cfg.sonarr.anime_tag_name.lower()
+                if anime_tag_name in profile_tags:
+                    anime_tag_id = profile_tags[anime_tag_name]
+                    log.debug("Found Anime Tag ID for '%s': %s", anime_tag_name, anime_tag_id)
+                else:
+                    log.warning("Anime Tag '%s' not found in Sonarr.", anime_tag_name)
 
     pvr_objects_list = get_objects(sonarr, 'Sonarr', notifications)
 
     # get trakt series list
+    # UPDATED: We pass None for countries/languages to API, so we get everything
     if list_type.lower() == 'anticipated':
         trakt_objects_list = trakt.get_anticipated_shows(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
         )
@@ -480,8 +490,8 @@ def shows(
     elif list_type.lower() == 'trending':
         trakt_objects_list = trakt.get_trending_shows(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
         )
@@ -489,8 +499,8 @@ def shows(
     elif list_type.lower() == 'popular':
         trakt_objects_list = trakt.get_popular_shows(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
         )
@@ -503,8 +513,8 @@ def shows(
         trakt_objects_list = trakt.get_person_shows(
             years=years,
             person=person,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
             include_non_acting_roles=include_non_acting_roles,
@@ -514,8 +524,8 @@ def shows(
         trakt_objects_list = trakt.get_recommended_shows(
             authenticate_user,
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
         )
@@ -524,8 +534,8 @@ def shows(
         most_type = misc_helper.substring_after(list_type.lower(), "_")
         trakt_objects_list = trakt.get_most_played_shows(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
             most_type=most_type if most_type else None,
@@ -535,8 +545,8 @@ def shows(
         most_type = misc_helper.substring_after(list_type.lower(), "_")
         trakt_objects_list = trakt.get_most_watched_shows(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
             most_type=most_type if most_type else None,
@@ -545,7 +555,7 @@ def shows(
     elif list_type.lower() == 'watchlist':
         trakt_objects_list = trakt.get_watchlist_shows(authenticate_user)
     else:
-        trakt_objects_list = trakt.get_user_list_shows(list_type, authenticate_user)
+        trakt_objects_list = trakt.get_user_list_movies(list_type, authenticate_user)
 
     if not trakt_objects_list:
         log.error("Aborting due to failure to retrieve Trakt \'%s\' shows list.", list_type.capitalize())
@@ -600,88 +610,169 @@ def shows(
         series_title = series['show']['title']
 
         # convert series year to string
-        if series['show']['year']:
-            series_year = str(series['show']['year'])
-        elif series['show']['first_aired']:
+        # Feature 1: Safe .get() included
+        year_data = series['show'].get('year')
+        if year_data:
+            series_year = str(year_data)
+        elif series['show'].get('first_aired'):
             series_year = misc_str.get_year_from_timestamp(series['show']['first_aired'])
         else:
             series_year = '????'
 
-        # series type
-        if any('anime' in s.lower() for s in series['show']['genres']):
+        # series type & folder & tags logic
+        genres_list = series['show'].get('genres', [])
+        
+        # Prepare Defaults
+        final_root_folder = cfg.sonarr.root_folder
+        final_tags = list(tag_ids) if tag_ids else [] # Copy list to avoid modifying global default
+        final_quality_profile_id = quality_profile_id # Default Quality
+        
+        # --- SMART ANIME DETECTION ---
+        is_anime = False
+        if any('anime' in s.lower() for s in genres_list):
+            is_anime = True
             series_type = 'anime'
+            
+            # Switch to Anime Folder if configured
+            if cfg.sonarr.get('anime_root_folder'):
+                final_root_folder = cfg.sonarr.anime_root_folder
+                
+            # Append Anime Tag if configured and found
+            if anime_tag_id:
+                if anime_tag_id not in final_tags:
+                    final_tags.append(anime_tag_id)
+            
+            # Switch Quality Profile if configured
+            if anime_quality_profile_id:
+                final_quality_profile_id = anime_quality_profile_id
         else:
             series_type = 'standard'
 
         log.debug("Set series type for \'%s (%s)\' to: %s", series_title, series_year, series_type.title())
 
         # build list of genres
-        series_genres = (', '.join(series['show']['genres'])).title() if series['show']['genres'] else 'N/A'
+        series_genres = (', '.join(genres_list)).title() if genres_list else 'N/A'
 
         try:
-            # check if movie has a valid TVDB ID and that it exists on TVDB
-            if not tvdb_helper.check_series_tvdb_id(series_title, series_year, series_tvdb_id):
-                continue
+            # --- 0. MANUAL GENRE CHECK (Universal Override) ---
+            # Explicitly checks genres against config for ALL content (Standard & Anime)
+            blacklisted_genres = cfg.filters.shows.get('blacklisted_genres', [])
+            if blacklisted_genres:
+                bad_genres = [g for g in genres_list if g.lower() in blacklisted_genres]
+                if bad_genres:
+                     log.info("SKIPPED: '%s' (Blacklisted Genre: %s)", series_title, ', '.join(bad_genres))
+                     continue
 
-            # check if genres matches genre(s) supplied via argument
+            # --- LOCAL FILTERING (The "Anime Exception" Logic) ---
+            # 1. Check Languages
+            if config_languages:
+                show_lang = (series['show'].get('language') or '').lower()
+                if show_lang not in config_languages:
+                    if not is_anime:
+                        log.debug("SKIPPED: '%s' (Language '%s' not allowed)", series_title, show_lang)
+                        continue
+            
+            # 2. Check Countries (Skip this local check - delegated to helper for Anime)
+            if not is_anime and config_countries:
+                show_country = (series['show'].get('country') or '').lower()
+                # Standard content must match allowed_countries
+                if show_country not in config_countries:
+                     log.debug("SKIPPED: '%s' (Country '%s' not allowed)", series_title, show_country)
+                     continue
+
+            # 3. Check Genres (Standard Logic - Redundant but harmless)
             if genres and not misc_helper.allowed_genres(genres, 'show', series):
                 log.debug("SKIPPING: \'%s (%s)\' because it was not from the genre(s): %s", series_title,
                           series_year, ', '.join(map(lambda x: x.title(), genres)))
                 continue
 
-            # check if series passes out blacklist criteria inspection
-            if not trakt_helper.is_show_blacklisted(
+            # 4. Check blacklist (With Configurable Anime Exception)
+            
+            # Create a clean copy of filters to modify for this specific check
+            current_filters = cfg.filters.shows.copy()
+            if is_anime:
+                # --- SIMPLIFIED LOGIC ---
+                # We simply force the allowed countries to be ['jp'].
+                # The helper function will then reject anything that isn't 'jp'.
+                current_filters['allowed_countries'] = ['jp']
+                current_filters['allowed_languages'] = ['ja'] # Added to fix language blocking
+
+                # Votes (STRICT SEPARATION: Only use Anime limit, or 0/Disable if not set)
+                anime_votes = cfg.filters.shows.get('blacklisted_anime_min_votes')
+                if anime_votes is not None and anime_votes != "":
+                    current_filters['blacklisted_min_votes'] = int(anime_votes)
+                else:
+                    current_filters['blacklisted_min_votes'] = 0 # Explicitly disable
+                
+                # Rating (STRICT SEPARATION: Only use Anime limit, or 0.0/Disable if not set)
+                anime_rating = cfg.filters.shows.get('blacklisted_anime_min_rating')
+                if anime_rating is not None and anime_rating != "":
+                    current_filters['blacklisted_min_rating'] = float(anime_rating)
+                else:
+                    current_filters['blacklisted_min_rating'] = 0.0 # Explicitly disable
+            
+            if trakt_helper.is_show_blacklisted(
                     series,
-                    cfg.filters.shows,
+                    current_filters,  # PASS MODIFIED FILTERS
                     ignore_blacklist,
                     callback_remove_recommended if remove_rejected_from_recommended else None,
+                    is_anime=is_anime
             ):
-
-                log.info("ADDING: %s (%s) | Country: %s | Language: %s | Genre(s): %s | Network: %s",
-                         series_title,
-                         series_year,
-                         (series['show']['country'] or 'N/A').upper(),
-                         (series['show']['language'] or 'N/A').upper(),
-                         series_genres,
-                         (series['show']['network'] or 'N/A').upper(),
-                         )
-
-                if dry_run:
-                    log.info("dry-run: SKIPPING")
-                else:
-                    # add show to sonarr
-                    if sonarr.add_series(
-                            series['show']['ids']['tvdb'],
-                            series_title,
-                            series['show']['ids']['slug'],
-                            quality_profile_id,
-                            language_profile_id,
-                            cfg.sonarr.root_folder,
-                            cfg.sonarr.season_folder,
-                            tag_ids,
-                            not no_search,
-                            series_type,
-                    ):
-
-                        if profile_tags is not None and tag_names is not None:
-                            log.info("ADDED: \'%s (%s)\' with Sonarr Tags: %s", series_title, series_year,
-                                     tag_names)
-                        else:
-                            log.info("ADDED: \'%s (%s)\'", series_title, series_year)
-                        if notifications:
-                            callback_notify({'event': 'add_show', 'list_type': list_type, 'show': series['show']})
-                        added_shows += 1
-                    else:
-                        if profile_tags is not None:
-                            log.error("FAILED ADDING: \'%s (%s)\' with Sonarr Tags: %s", series_title, series_year,
-                                      tag_names)
-                        else:
-                            log.info("FAILED ADDING: \'%s (%s)\'", series_title, series_year)
-                        continue
-
-            else:
                 log.info("SKIPPED: \'%s (%s)\'", series_title, series_year)
                 continue
+
+            # 5. Check if show has a valid TVDB ID and that it exists on TVDB (Network Call)
+            if not tvdb_helper.check_series_tvdb_id(series_title, series_year, series_tvdb_id):
+                continue
+
+            # 6. Proceed to Add
+            log.info("ADDING: %s (%s) | Country: %s | Language: %s | Genre(s): %s | Network: %s",
+                     series_title,
+                     series_year,
+                     (series['show'].get('country', 'N/A') or 'N/A').upper(),
+                     (series['show'].get('language', 'N/A') or 'N/A').upper(),
+                     series_genres,
+                     (series['show'].get('network', 'N/A') or 'N/A').upper(),
+             )
+
+            if dry_run:
+                log.info("dry-run: SKIPPING")
+            else:
+                # add show to sonarr
+                if sonarr.add_series(
+                        series['show']['ids']['tvdb'],
+                        series_title,
+                        series['show']['ids']['slug'],
+                        final_quality_profile_id, # Use dynamic quality
+                        final_root_folder,        # Use dynamic folder
+                        cfg.sonarr.season_folder,
+                        final_tags,               # Use dynamic tags
+                        not no_search,
+                        series_type,
+                ):
+
+                    if profile_tags is not None and tag_names is not None:
+                        log.info("ADDED: \'%s (%s)\' with Sonarr Tags: %s", series_title, series_year,
+                                 tag_names)
+                    else:
+                        log.info("ADDED: \'%s (%s)\'", series_title, series_year)
+                    
+                    # Feature 5: Record Stats for Summary
+                    # FIXED: Storing Object, not String
+                    # FIXED: Added Destination Folder to object for verification
+                    series['root_folder'] = final_root_folder
+                    run_stats['shows'].append(series)
+
+                    if notifications:
+                        callback_notify({'event': 'add_show', 'list_type': list_type, 'show': series['show']})
+                    added_shows += 1
+                else:
+                    if profile_tags is not None:
+                        log.error("FAILED ADDING: \'%s (%s)\' with Sonarr Tags: %s", series_title, series_year,
+                                  tag_names)
+                    else:
+                        log.info("FAILED ADDING: \'%s (%s)\'", series_title, series_year)
+                    continue
 
             # stop adding shows, if added_shows >= add_limit
             if add_limit and added_shows >= add_limit:
@@ -766,7 +857,9 @@ def movie(
         return None
 
     # convert movie year to string
-    movie_year = str(trakt_movie['year']) if trakt_movie['year'] else '????'
+    # Feature 1: Safe .get() included
+    year_data = trakt_movie.get('year')
+    movie_year = str(year_data) if year_data else '????'
 
     log.info("Retrieved Trakt movie information for \'%s\': \'%s (%s)\'", movie_id, trakt_movie['title'], movie_year)
 
@@ -899,17 +992,25 @@ def movies(
 
     added_movies = 0
 
-    # process countries
-    if not cfg.filters.movies.allowed_countries or 'ignore' in cfg.filters.movies.allowed_countries:
-        countries = None
-    else:
-        countries = cfg.filters.movies.allowed_countries
+    # -------------------------------------------------------------
+    # DYNAMIC YEAR LOGIC
+    # If blacklisted_max_year is empty ("") or None, update it to Current Year
+    # -------------------------------------------------------------
+    max_year = cfg.filters.movies.get('blacklisted_max_year')
+    if max_year == "" or max_year is None:
+        current_year = datetime.datetime.now().year
+        cfg['filters']['movies']['blacklisted_max_year'] = current_year
+        log.debug("Dynamic Config: 'blacklisted_max_year' set to Current Year (%s)", current_year)
+    # -------------------------------------------------------------
 
-    # process languages
-    if not cfg.filters.movies.allowed_languages or 'ignore' in cfg.filters.movies.allowed_languages:
-        languages = None
-    else:
-        languages = cfg.filters.movies.allowed_languages
+    # --- UPDATED: Retrieve config filters but DON'T send to API ---
+    config_countries = None
+    if cfg.filters.movies.allowed_countries and 'ignore' not in cfg.filters.movies.allowed_countries:
+        config_countries = cfg.filters.movies.allowed_countries
+
+    config_languages = None
+    if cfg.filters.movies.allowed_languages and 'ignore' not in cfg.filters.movies.allowed_languages:
+        config_languages = cfg.filters.movies.allowed_languages
 
     # process genres
     if genres:
@@ -985,8 +1086,8 @@ def movies(
     if list_type.lower() == 'anticipated':
         trakt_objects_list = trakt.get_anticipated_movies(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
         )
@@ -994,8 +1095,8 @@ def movies(
     elif list_type.lower() == 'trending':
         trakt_objects_list = trakt.get_trending_movies(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
         )
@@ -1003,8 +1104,8 @@ def movies(
     elif list_type.lower() == 'popular':
         trakt_objects_list = trakt.get_popular_movies(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
         )
@@ -1020,8 +1121,8 @@ def movies(
         trakt_objects_list = trakt.get_person_movies(
             years=years,
             person=person,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
             include_non_acting_roles=include_non_acting_roles,
@@ -1031,8 +1132,8 @@ def movies(
         trakt_objects_list = trakt.get_recommended_movies(
             authenticate_user,
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
         )
@@ -1041,8 +1142,8 @@ def movies(
         most_type = misc_helper.substring_after(list_type.lower(), "_")
         trakt_objects_list = trakt.get_most_played_movies(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
             most_type=most_type if most_type else None,
@@ -1052,8 +1153,8 @@ def movies(
         most_type = misc_helper.substring_after(list_type.lower(), "_")
         trakt_objects_list = trakt.get_most_watched_movies(
             years=years,
-            countries=countries,
-            languages=languages,
+            countries=None,
+            languages=None,
             genres=genres,
             runtimes=runtimes,
             most_type=most_type if most_type else None,
@@ -1124,81 +1225,166 @@ def movies(
         # noinspection PyBroadException
 
         # set common series variables
-        movie_title = sorted_movie['movie']['title']
-        movie_tmdb_id = sorted_movie['movie']['ids']['tmdb']
-        movie_imdb_id = sorted_movie['movie']['ids']['imdb']
+        movie_data = sorted_movie.get('movie', {})
+        movie_ids = movie_data.get('ids', {})
+
+        movie_title = movie_data.get('title')
+        movie_tmdb_id = movie_ids.get('tmdb')
+        movie_imdb_id = movie_ids.get('imdb')
+
+        if movie_tmdb_id is None or movie_imdb_id is None:
+            continue
+
 
         # convert movie year to string
-        movie_year = str(sorted_movie['movie']['year']) \
-            if sorted_movie['movie']['year'] else '????'
+        year_data = sorted_movie['movie'].get('year')
+        movie_year = str(year_data) if year_data else '????'
 
         # build list of genres
-        movie_genres = (', '.join(sorted_movie['movie']['genres'])).title() \
-            if sorted_movie['movie']['genres'] else 'N/A'
+        genres_list = sorted_movie['movie'].get('genres', [])
+        movie_genres = (', '.join(genres_list)).title() if genres_list else 'N/A'
 
         try:
-            # check if movie has a valid TMDb ID and that it exists on TMDb
-            if not tmdb_helper.check_movie_tmdb_id(movie_title, movie_year, movie_tmdb_id):
-                continue
+            # --- LOCAL FILTERING (The "Anime Exception" Logic) ---
+            is_anime = False
+            if any('anime' in s.lower() for s in genres_list):
+                 is_anime = True
 
-            # check if genres matches genre(s) supplied via argument
+            # 0. Check Genre Blacklist (MANUAL OVERRIDE to fix helper issue)
+            # Applied to ALL content (Standard AND Anime) as per user request
+            blacklisted_genres = cfg.filters.movies.get('blacklisted_genres', [])
+            if blacklisted_genres:
+                bad_genres = [g for g in genres_list if g.lower() in blacklisted_genres]
+                if bad_genres:
+                     log.info("SKIPPED: '%s' (Blacklisted Genre: %s)", movie_title, ', '.join(bad_genres))
+                     continue
+
+            # 1. Check Languages
+            if config_languages:
+                movie_lang = (sorted_movie['movie'].get('language') or '').lower()
+                if movie_lang not in config_languages:
+                    if not is_anime:
+                        log.debug("SKIPPED: '%s' (Language '%s' not allowed)", movie_title, movie_lang)
+                        continue
+            
+            # 2. Check Countries (Skip this local check - delegated to helper for Anime)
+            if not is_anime and config_countries:
+                movie_country = (sorted_movie['movie'].get('country') or '').lower()
+                # Standard content must match allowed_countries
+                if movie_country not in config_countries:
+                     log.debug("SKIPPED: '%s' (Country '%s' not allowed)", movie_title, movie_country)
+                     continue
+
+            # 3. Check if genres matches genre(s) supplied via argument
             if genres and not misc_helper.allowed_genres(genres, 'movie', sorted_movie):
                 log.debug("SKIPPING: \'%s (%s)\' because it was not from the genre(s): %s", movie_title,
                           movie_year, ', '.join(map(lambda x: x.title(), genres)))
                 continue
 
-            # check if movie passes out blacklist criteria inspection
-            if not trakt_helper.is_movie_blacklisted(
+            # 4. Check blacklist (With Configurable Anime Exception)
+            
+            # Create a clean copy of filters to modify for this specific check
+            current_filters = cfg.filters.movies.copy()
+            if is_anime:
+                # --- SIMPLIFIED LOGIC ---
+                # We simply force the allowed countries to be ['jp'].
+                # The helper function will then reject anything that isn't 'jp'.
+                current_filters['allowed_countries'] = ['jp']
+                current_filters['allowed_languages'] = ['ja'] # Added to fix language blocking
+                
+                # Votes (STRICT SEPARATION: Only use Anime limit, or 0/Disable if not set)
+                anime_votes = cfg.filters.movies.get('blacklisted_anime_min_votes')
+                if anime_votes is not None and anime_votes != "":
+                    current_filters['blacklisted_min_votes'] = int(anime_votes)
+                else:
+                    current_filters['blacklisted_min_votes'] = 0 # Explicitly disable
+                
+                # Rating (STRICT SEPARATION: Only use Anime limit, or 0.0/Disable if not set)
+                anime_rating = cfg.filters.movies.get('blacklisted_anime_min_rating')
+                if anime_rating is not None and anime_rating != "":
+                    current_filters['blacklisted_min_rating'] = float(anime_rating)
+                else:
+                    current_filters['blacklisted_min_rating'] = 0.0 # Explicitly disable
+            
+            if trakt_helper.is_movie_blacklisted(
                     sorted_movie,
-                    cfg.filters.movies,
+                    current_filters,  # PASS MODIFIED FILTERS
                     ignore_blacklist,
                     callback_remove_recommended if remove_rejected_from_recommended else None,
+                    is_anime=is_anime
             ):
-
-                # Skip movie if below user specified min RT score
-                if rotten_tomatoes is not None and cfg.omdb.api_key:
-                    if not omdb_helper.does_movie_have_min_req_rt_score(
-                            cfg.omdb.api_key,
-                            movie_title,
-                            movie_year,
-                            movie_imdb_id,
-                            rotten_tomatoes,
-                    ):
-                        continue
-
-                log.info("ADDING: \'%s (%s)\' | Country: %s | Language: %s | Genre(s): %s ",
-                         movie_title,
-                         movie_year,
-                         (sorted_movie['movie']['country'] or 'N/A').upper(),
-                         (sorted_movie['movie']['language'] or 'N/A').upper(),
-                         movie_genres,
-                         )
-
-                if dry_run:
-                    log.info("dry-run: SKIPPING")
-                else:
-                    # add movie to radarr
-                    if radarr.add_movie(
-                            sorted_movie['movie']['ids']['tmdb'],
-                            movie_title,
-                            movie_year,
-                            sorted_movie['movie']['ids']['slug'],
-                            quality_profile_id,
-                            cfg.radarr.root_folder,
-                            cfg.radarr.minimum_availability,
-                            not no_search,
-                    ):
-
-                        log.info("ADDED: \'%s (%s)\'", movie_title, movie_year)
-                        if notifications:
-                            callback_notify({'event': 'add_movie', 'list_type': list_type, 'movie': sorted_movie['movie']})
-                        added_movies += 1
-                    else:
-                        log.error("FAILED ADDING: \'%s (%s)\'", movie_title, movie_year)
-                        continue
-            else:
                 log.info("SKIPPED: \'%s (%s)\'", movie_title, movie_year)
                 continue
+
+            # 5. Check if movie has a valid TMDb ID and that it exists on TMDb (Network Call)
+            if not tmdb_helper.check_movie_tmdb_id(movie_title, movie_year, movie_tmdb_id):
+                continue
+
+            # 6. Skip movie if below user specified min RT score (Network Call)
+            if rotten_tomatoes is not None and cfg.omdb.api_key:
+                if not omdb_helper.does_movie_have_min_req_rt_score(
+                        cfg.omdb.api_key,
+                        movie_title,
+                        movie_year,
+                        movie_imdb_id,
+                        rotten_tomatoes,
+                ):
+                    continue
+
+            # 7. Proceed to Add
+            log.info("ADDING: \'%s (%s)\' | Country: %s | Language: %s | Genre(s): %s ",
+                     movie_title,
+                     movie_year,
+                     (sorted_movie['movie'].get('country', 'N/A') or 'N/A').upper(),
+                     (sorted_movie['movie'].get('language', 'N/A') or 'N/A').upper(),
+                     movie_genres,
+                     )
+
+            if dry_run:
+                log.info("dry-run: SKIPPING")
+            else:
+                # add movie to radarr
+                if radarr.add_movie(
+                        sorted_movie['movie']['ids']['tmdb'],
+                        movie_title,
+                        movie_year,
+                        sorted_movie['movie']['ids']['slug'],
+                        quality_profile_id,
+                        cfg.radarr.root_folder,
+                        cfg.radarr.minimum_availability,
+                        not no_search,
+                ):
+
+                    log.info("ADDED: \'%s (%s)\'", movie_title, movie_year)
+                    
+                    # -------------------------------------------------------------
+                    # FEATURE: FETCH RT SCORE FOR RUN SUMMARY
+                    # -------------------------------------------------------------
+                    try:
+                        if cfg.omdb.api_key and movie_imdb_id:
+                            rt_url = "http://www.omdbapi.com/?apikey={}&i={}&tomatoes=true".format(cfg.omdb.api_key, movie_imdb_id)
+                            rt_res = requests.get(rt_url, timeout=5)
+                            if rt_res.status_code == 200:
+                                rt_data = rt_res.json()
+                                ratings = rt_data.get('Ratings', [])
+                                for rating_item in ratings:
+                                    if rating_item.get('Source') == 'Rotten Tomatoes':
+                                        sorted_movie['movie']['rt_score'] = rating_item.get('Value')
+                                        break
+                    except Exception:
+                        pass # Fail silently if OMDb fetch fails, summary just won't show it
+                    # -------------------------------------------------------------
+
+                    # Feature 5: Record Stats for Summary
+                    sorted_movie['root_folder'] = cfg.radarr.root_folder
+                    run_stats['movies'].append(sorted_movie)
+
+                    if notifications:
+                        callback_notify({'event': 'add_movie', 'list_type': list_type, 'movie': sorted_movie['movie']})
+                    added_movies += 1
+                else:
+                    log.error("FAILED ADDING: \'%s (%s)\'", movie_title, movie_year)
+                    continue
 
             # stop adding movies, if added_movies >= add_limit
             if add_limit and added_movies >= add_limit:
@@ -1252,8 +1438,9 @@ def callback_notify(data):
     if data['event'] == 'add_movie':
 
         # convert movie year to string
-        movie_year = str(data['movie']['year']) \
-            if data['movie']['year'] else '????'
+        # Feature 1: Safe .get() included
+        year_data = data['movie'].get('year')
+        movie_year = str(year_data) if year_data else '????'
 
         if cfg.notifications.verbose:
             notify.send(
@@ -1263,7 +1450,9 @@ def callback_notify(data):
     elif data['event'] == 'add_show':
 
         # convert series year to string
-        series_year = str(data['show']['year']) if data['show']['year'] else '????'
+        # Feature 1: Safe .get() included
+        year_data = data['show'].get('year')
+        series_year = str(year_data) if year_data else '????'
 
         if cfg.notifications.verbose:
             notify.send(
@@ -1286,6 +1475,90 @@ def callback_notify(data):
 # AUTOMATIC
 ############################################################
 
+# Feature 5: Run Summary
+def print_run_summary():
+    global run_stats, cfg
+    
+    if run_stats['movies'] or run_stats['shows']:
+        log.info("############################################################")
+        log.info("# RUN SUMMARY")
+        log.info("############################################################")
+        
+        # --- MOVIES SUMMARY ---
+        if run_stats['movies']:
+            log.info("Movies Added (%d):", len(run_stats['movies']))
+            for item in run_stats['movies']:
+                # Safe Extraction
+                movie = item.get('movie', {})
+                title = movie.get('title', 'Unknown')
+                year = movie.get('year') or '????'
+                dest_folder = item.get('root_folder', 'N/A')
+                
+                # Standard Info (Always shown)
+                log.info("   > %s (%s)", title, year)
+                
+                # Detailed Auditing Data (DEBUG ONLY)
+                if cfg.core.debug:
+                    log.info("        Destination: %s", dest_folder)
+                    
+                    country = (movie.get('country') or 'us').upper()
+                    language = (movie.get('language') or 'en').upper()
+                    genres = ", ".join(movie.get('genres', []))
+                    rating = movie.get('rating', 0.0)
+                    votes = movie.get('votes', 0)
+                    runtime = movie.get('runtime', 0)
+                    certification = movie.get('certification', 'N/A')
+                    rt_score = movie.get('rt_score', 'N/A') # Populated by fetch logic
+
+                    log.info("        Genre:         %s", genres)
+                    log.info("        Rating:        %.1f (%s votes) | RT: %s", rating, "{:,}".format(votes), rt_score)
+                    log.info("        Language:      %s", language)
+                    log.info("        Country:       %s", country)
+                    log.info("        Runtime:       %sm", runtime)
+                    log.info("        Certification: %s", certification)
+                    log.info("") # Empty line for spacing in debug mode
+
+        # --- SHOWS SUMMARY ---
+        if run_stats['shows']:
+            log.info("Shows Added (%d):", len(run_stats['shows']))
+            for item in run_stats['shows']:
+                # Safe Extraction
+                show = item.get('show', {})
+                title = show.get('title', 'Unknown')
+                year = show.get('year') or '????'
+                dest_folder = item.get('root_folder', 'N/A')
+                
+                # Standard Info (Always shown)
+                log.info("   > %s (%s)", title, year)
+                
+                # Detailed Auditing Data (DEBUG ONLY)
+                if cfg.core.debug:
+                    log.info("        Destination: %s", dest_folder)
+
+                    country = (show.get('country') or 'us').upper()
+                    language = (show.get('language') or 'en').upper()
+                    genres = ", ".join(show.get('genres', []))
+                    rating = show.get('rating', 0.0)
+                    votes = show.get('votes', 0)
+                    runtime = show.get('runtime', 0)
+                    certification = show.get('certification', 'N/A')
+                    network = (show.get('network') or 'N/A').upper()
+
+                    log.info("        Genre:         %s", genres)
+                    log.info("        Rating:        %.1f (%s votes)", rating, "{:,}".format(votes))
+                    log.info("        Network:       %s", network)
+                    log.info("        Language:      %s", language)
+                    log.info("        Country:       %s", country)
+                    log.info("        Runtime:       %sm", runtime)
+                    log.info("        Certification: %s", certification)
+                    log.info("") # Empty line for spacing in debug mode
+                
+        log.info("############################################################")
+        log.info("")
+        
+        # Reset stats for next run
+        run_stats['movies'] = []
+        run_stats['shows'] = []
 
 def automatic_shows(
         add_delay=2.5,
@@ -1296,6 +1569,8 @@ def automatic_shows(
 ):
 
     from media.trakt import Trakt
+
+    # REMOVED: reset_log_file() (Feature 6 excluded)
 
     total_shows_added = 0
     # noinspection PyBroadException
@@ -1362,6 +1637,7 @@ def automatic_shows(
                         notifications=notifications,
                         authenticate_user=authenticate_user,
                         ignore_blacklist=local_ignore_blacklist,
+                        # ...
                     )
 
             elif list_type.lower() == 'lists':
@@ -1401,7 +1677,7 @@ def automatic_shows(
 
             if added_shows is None:
                 if list_type.lower() != 'lists':
-                    log.info("FAILED ADDING shows from Trakt's \'%s\' list.", list_type)
+                    log.info("FAILED ADDING shows from Trakt's \'%s\' list.", list_type.capitalize())
                 time.sleep(10)
                 continue
             total_shows_added += added_shows
@@ -1429,6 +1705,8 @@ def automatic_movies(
 ):
 
     from media.trakt import Trakt
+
+    # REMOVED: reset_log_file() (Feature 6 excluded)
 
     total_movies_added = 0
     # noinspection PyBroadException
@@ -1594,6 +1872,8 @@ def run(
 
     log.info("Automatic mode is now running.")
 
+    # REMOVED: reset_log_file() (Feature 6 excluded)
+
     # send notification
     if not no_notifications and cfg.notifications.verbose:
         notify.send(message="Automatic mode is now running.")
@@ -1629,6 +1909,9 @@ def run(
 
             # Sleep between tasks
             time.sleep(add_delay)
+    
+    # Feature 5: Print summary after immediate run
+    print_run_summary()
 
     # Enter running schedule
     while True:
@@ -1638,6 +1921,9 @@ def run(
             time.sleep(max(schedule.idle_seconds(), 0))
             # Check jobs to run
             schedule.run_pending()
+            
+            # Feature 5: Print summary after scheduled runs
+            print_run_summary()
 
         except Exception as e:
             log.exception("Unhandled exception occurred while processing scheduled tasks: %s", e)
